@@ -144,7 +144,7 @@ pub struct People {
     #[serde(rename = "Identity_Lawyer")]
     pub identity_lawyer: Option<String>,
     #[serde(rename = "Opinion")]
-    pub opinion: Opinion,
+    pub opinion: Vec<Opinion>,
 }
 
 #[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
