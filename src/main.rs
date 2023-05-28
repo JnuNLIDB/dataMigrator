@@ -8,8 +8,7 @@ use std::fmt::Write;
 
 use backoff::future::retry;
 use backoff::ExponentialBackoff;
-use sqlx::postgres::PgPoolOptions;
-use sqlx::{Error, Pool, Postgres, Row};
+use sqlx::{Error, Pool, Row, Sqlite};
 use std::fs::File;
 
 use std::io::BufReader;
@@ -18,98 +17,84 @@ use std::path::Path;
 use crate::schema::Root;
 use dotenv::dotenv;
 use indicatif::{ProgressBar, ProgressState, ProgressStyle};
-use log::{error, info, warn};
+use log::{error, warn};
+use sqlx::sqlite::SqlitePoolOptions;
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     dotenv().ok();
-    env_logger::builder().filter_level(log::LevelFilter::Warn).init();
+    env_logger::builder()
+        .filter_level(log::LevelFilter::Info)
+        .filter_module("sqlx", log::LevelFilter::Error)
+        .init();
 
-    let url = std::env::var("POSTGRES_URL").expect("POSTGRES_URL must be set.");
-    let pool = PgPoolOptions::new()
+    let pool = SqlitePoolOptions::new()
         .max_connections(400)
-        .connect(&url)
+        .connect("./data.db")
         .await?;
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS country (
-        id INT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
-        name TEXT UNIQUE NOT NULL,
-        geography TEXT,
-        belt_and_road BOOLEAN
-    )",
-    ).execute(&pool).await?;
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE NOT NULL,
+            geography TEXT,
+            belt_and_road BOOLEAN
+        )",
+    )
+    .execute(&pool)
+    .await?;
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS people (
-        id INT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
-        name TEXT UNIQUE NOT NULL,
-        country_id INT,
-        title TEXT,
-        origin TEXT,
-        identity TEXT,
-        CONSTRAINT fk_country
-            FOREIGN KEY (country_id)
-            REFERENCES country(id)
-            ON DELETE CASCADE
-    );",
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE NOT NULL,
+            country_id INTEGER,
+            title TEXT,
+            origin TEXT,
+            identity TEXT,
+            FOREIGN KEY (country_id) REFERENCES country(id)
+        )",
     )
-
     .execute(&pool)
     .await?;
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS source (
-        id INT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT UNIQUE NOT NULL,
-        country_id INT,
+        country_id INTEGER,
         origin TEXT,
-        CONSTRAINT fk_country
-            FOREIGN KEY (country_id)
-            REFERENCES country(id)
-            ON DELETE CASCADE
+        FOREIGN KEY (country_id) REFERENCES country(id)
     );",
     )
     .execute(&pool)
     .await?;
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS article (
-        id INT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
         title TEXT UNIQUE NOT NULL,
-        time INT NOT NULL
+        time INTEGER NOT NULL
     );",
     )
     .execute(&pool)
     .await?;
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS source_article (\
-        source_id INT NOT NULL,
-        article_id INT NOT NULL,
+        source_id INTEGER NOT NULL,
+        article_id INTEGER NOT NULL,
         UNIQUE (source_id, article_id),
-        CONSTRAINT fk_source
-            FOREIGN KEY (source_id)
-            REFERENCES source(id)
-            ON DELETE CASCADE,
-        CONSTRAINT fk_article
-            FOREIGN KEY (article_id)
-            REFERENCES article(id)
-            ON DELETE CASCADE
+        FOREIGN KEY (source_id) REFERENCES source(id),
+        FOREIGN KEY (article_id) REFERENCES article(id)
     );",
     )
     .execute(&pool)
     .await?;
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS opinion (
-        id INT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
-        author_id INT NOT NULL,
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        author_id INTEGER NOT NULL,
         text TEXT UNIQUE NOT NULL,
-        article_id INT NOT NULL,
-        CONSTRAINT fk_author
-            FOREIGN KEY (author_id)
-            REFERENCES people(id)
-            ON DELETE CASCADE,
-        CONSTRAINT fk_article
-            FOREIGN KEY (article_id)
-            REFERENCES article(id)
-            ON DELETE CASCADE
+        article_id INTEGER NOT NULL,
+        FOREIGN KEY (author_id) REFERENCES people(id),
+        FOREIGN KEY (article_id) REFERENCES article(id)
     );",
     )
     .execute(&pool)
@@ -118,17 +103,14 @@ async fn main() -> Result<(), Error> {
     // Iterate over file in data folder
     warn!("Start processing files in data folder");
     let data_dir = Path::new("./data_new");
-    let iter = data_dir
-        .read_dir()
-        .unwrap()
-        .filter_map(|entry| {
-            let entry = entry.unwrap();
-            if entry.file_type().unwrap().is_file() {
-                Some(entry.path())
-            } else {
-                None
-            }
-        });
+    let iter = data_dir.read_dir().unwrap().filter_map(|entry| {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_file() {
+            Some(entry.path())
+        } else {
+            None
+        }
+    });
     for path in iter {
         let file = File::open(&path).unwrap();
         let reader = BufReader::new(file);
@@ -139,7 +121,7 @@ async fn main() -> Result<(), Error> {
     Ok(())
 }
 
-async fn process_roots(pool: &Pool<Postgres>, roots: Vec<Root>) -> Result<(), Error> {
+async fn process_roots(pool: &Pool<Sqlite>, roots: Vec<Root>) -> Result<(), Error> {
     let mut futs = FuturesUnordered::new();
     let pb = ProgressBar::new(roots.len() as u64);
     pb.set_style(ProgressStyle::with_template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({eta})")
@@ -159,50 +141,46 @@ async fn process_roots(pool: &Pool<Postgres>, roots: Vec<Root>) -> Result<(), Er
                 let country_id = match source.country {
                     Some(_) => Some(
                         retry(ExponentialBackoff::default(), || async {
+                            sqlx::query(
+                                "INSERT OR IGNORE INTO country (name, geography, belt_and_road) \
+                                        VALUES ($1, $2, $3)",
+                            )
+                                .bind(&source.country)
+                                .bind(&source.geography)
+                                .bind(source.orob.is_some())
+                                .execute(&pool)
+                                .await.inspect_err(|e| pb.suspend(|| error!("1. {:?}", e)))?;
                             Ok(
-                                match sqlx::query(
-                                    "INSERT INTO country (name, geography, belt_and_road) \
-                                        VALUES ($1, $2, $3) ON CONFLICT (name) DO NOTHING RETURNING id",
-                                )
+                                sqlx::query("SELECT id FROM country WHERE name = $1")
                                     .bind(&source.country)
-                                    .bind(&source.geography)
-                                    .bind(&source.orob.is_some())
                                     .fetch_one(&pool)
-                                    .await
-                                {
-                                    Ok(row) => row.get::<i32, _>("id"),
-                                    Err(e1) => sqlx::query("SELECT id FROM country WHERE name = $1")
-                                        .bind(&source.country)
-                                        .fetch_one(&pool)
-                                        .await.inspect_err(|e2| error!("1. {:?}, 2. {:?}", e1, e2))?
-                                        .get::<i32, _>("id"),
-                                }
+                                    .await.inspect_err(|e| pb.suspend(|| error!("1. {:?}", e)))?
+                                    .get::<i32, _>("id")
                             )
                         }).await?
                     ),
                     None => None,
                 };
                 let id = retry(ExponentialBackoff::default(), || async {
-                    Ok(
-                        match sqlx::query(
-                            "INSERT INTO source (name, country_id, origin) \
+                    sqlx::query(
+                        "INSERT OR IGNORE INTO source (name, country_id, origin) \
                             VALUES ($1, $2, $3) ON CONFLICT (name) DO NOTHING RETURNING id",
-                        )
+                    )
+                        .bind(&source.name)
+                        .bind(country_id)
+                        .bind(&source.get_from())
+                        .execute(&pool)
+                        .await.inspect_err(|e| pb.suspend(|| error!("1. {:?}", e)))?;
+                    Ok(
+                        sqlx::query("SELECT id FROM source WHERE name = $1")
                             .bind(&source.name)
-                            .bind(country_id)
-                            .bind(&source.get_from())
                             .fetch_one(&pool)
                             .await
-                        {
-                            Ok(row) => row.get::<i32, _>("id"),
-                            Err(e1) => sqlx::query("SELECT id FROM source WHERE name = $1")
-                                .bind(&source.name)
-                                .fetch_one(&pool)
-                                .await.inspect_err(|e2| error!("1. {:?}, 2. {:?}", e1, e2))?
-                                .get::<i32, _>("id"),
-                        }
+                            .inspect_err(|e| pb.suspend(|| error!("1. {:?}", e)))?
+                            .get::<i32, _>("id")
                     )
-                }).await?;
+                })
+                .await?;
                 source_ids.push(id);
             }
 
@@ -212,128 +190,123 @@ async fn process_roots(pool: &Pool<Postgres>, roots: Vec<Root>) -> Result<(), Er
             };
 
             let article_id = retry(ExponentialBackoff::default(), || async {
+                sqlx::query(
+                    "INSERT OR IGNORE INTO article (title, time) \
+                        VALUES ($1, $2)",
+                )
+                    .bind(&x.headline)
+                    .bind(update_time)
+                    .execute(&pool)
+                    .await.inspect_err(|e| pb.suspend(|| error!("1. {:?}", e)))?;
                 Ok(
-                    match sqlx::query(
-                        "INSERT INTO article (title, time) \
-                        VALUES ($1, $2) ON CONFLICT (title) DO NOTHING RETURNING id",
-                    )
+                    sqlx::query("SELECT id FROM article WHERE title = $1")
                         .bind(&x.headline)
-                        .bind(update_time)
                         .fetch_one(&pool)
                         .await
-                    {
-                        Ok(row) => row.get::<i32, _>("id"),
-                        Err(e1) => sqlx::query("SELECT id FROM article WHERE title = $1")
-                            .bind(&x.headline)
-                            .fetch_one(&pool)
-                            .await.inspect_err(|e2| pb.suspend(|| error!("1. {:?}, 2. {:?}", e1, e2)))?
-                            .get::<i32, _>("id"),
-                    },
+                        .inspect_err(|e| pb.suspend(|| error!("1. {:?}", e)))?
+                        .get::<i32, _>("id")
                 )
             })
-                .await?;
+            .await?;
 
             let people_country_id = match x.people.country {
                 Some(_) => Some(
                     retry(ExponentialBackoff::default(), || async {
+                        sqlx::query(
+                            "INSERT OR IGNORE INTO country (name, geography, belt_and_road) \
+                                    VALUES ($1, $2, $3)",
+                        )
+                            .bind(&x.people.country)
+                            .bind(&x.people.geography)
+                            .bind(x.people.orob.is_some())
+                            .execute(&pool)
+                            .await.inspect_err(|e| pb.suspend(|| error!("1. {:?}", e)))?;
                         Ok(
-                            match sqlx::query(
-                                "INSERT INTO country (name, geography, belt_and_road) \
-                                    VALUES ($1, $2, $3) ON CONFLICT (name) DO NOTHING RETURNING id",
-                            )
+                            sqlx::query("SELECT id FROM country WHERE name = $1")
                                 .bind(&x.people.country)
-                                .bind(&x.people.geography)
-                                .bind(&x.people.orob.is_some())
                                 .fetch_one(&pool)
                                 .await
-                            {
-                                Ok(row) => row.get::<i32, _>("id"),
-                                Err(e1) => sqlx::query("SELECT id FROM country WHERE name = $1")
-                                    .bind(&x.people.country)
-                                    .fetch_one(&pool)
-                                    .await.inspect_err(|e2| error!("1. {:?}, 2. {:?}", e1, e2))?
-                                    .get::<i32, _>("id"),
-                            }
+                                .inspect_err(|e| pb.suspend(|| error!("1. {:?}", e)))?
+                                .get::<i32, _>("id")
                         )
                     })
-                        .await?,
+                    .await?,
                 ),
                 None => None,
             };
 
             let author_id = retry(ExponentialBackoff::default(), || async {
+                sqlx::query(
+                    "INSERT OR IGNORE INTO people (name, country_id, origin, title, identity) \
+                        VALUES ($1, $2, $3, $4, $5)",
+                )
+                    .bind(&x.people.name)
+                    .bind(people_country_id)
+                    .bind(&x.people.get_from())
+                    .bind(&x.people.title)
+                    .bind(&x.people.get_identity())
+                    .execute(&pool)
+                    .await.inspect_err(|e| pb.suspend(|| error!("1. {:?}", e)))?;
                 Ok(
-                    match sqlx::query(
-                        "INSERT INTO people (name, country_id, origin, title, identity) \
-                        VALUES ($1, $2, $3, $4, $5) ON CONFLICT (name) DO NOTHING RETURNING id",
-                    )
+                    sqlx::query("SELECT id FROM people WHERE name = $1")
                         .bind(&x.people.name)
-                        .bind(people_country_id)
-                        .bind(&x.people.get_from())
-                        .bind(&x.people.title)
-                        .bind(&x.people.get_identity())
                         .fetch_one(&pool)
                         .await
-                    {
-                        Ok(row) => row.get::<i32, _>("id"),
-                        Err(e1) => sqlx::query("SELECT id FROM people WHERE name = $1")
-                            .bind(&x.people.name)
-                            .fetch_one(&pool)
-                            .await.inspect_err(|e2| pb.suspend(|| error!("1. {:?}, 2. {:?}", e1, e2)))?
-                            .get::<i32, _>("id"),
-                    }
+                        .inspect_err(|e| pb.suspend(|| error!("1. {:?}", e))).unwrap()
+                        .get::<i32, _>("id")
                 )
-            }).await?;
+            })
+            .await?;
 
             for source_id in source_ids {
                 retry(ExponentialBackoff::default(), || async {
                     Ok(sqlx::query(
-                        "INSERT INTO source_article (source_id, article_id) \
-                    VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                        "INSERT OR IGNORE INTO source_article (source_id, article_id) \
+                    VALUES ($1, $2)",
                     )
-                        .bind(&source_id)
-                        .bind(&article_id)
-                        .execute(&pool)
-                        .await.inspect_err(|e| pb.suspend(|| error!("1. {:?}", e)))?)
+                    .bind(source_id)
+                    .bind(&article_id)
+                    .execute(&pool)
+                    .await
+                    .inspect_err(|e| pb.suspend(|| error!("1. {:?}", e)))?)
                 })
-                    .await?;
+                .await?;
             }
 
             for op in x.people.opinion {
                 retry(ExponentialBackoff::default(), || async {
                     let result = sqlx::query(
-                        "INSERT INTO opinion (author_id, text, article_id) \
-                                VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+                        "INSERT OR IGNORE INTO opinion (author_id, text, article_id) \
+                                VALUES ($1, $2, $3)",
                     )
-                        .bind(&author_id)
-                        .bind(&op.text)
-                        .bind(&article_id)
-                        .execute(&pool)
-                        .await;
-                    Ok(
-                        match result {
-                            Err(e) => {
-                                let error = e.as_database_error().unwrap();
-                                match error.code().unwrap().as_ref() {
-                                    "54000" => Ok(()),
-                                    _ => Err(e),
-                                }
+                    .bind(&author_id)
+                    .bind(&op.text)
+                    .bind(&article_id)
+                    .execute(&pool)
+                    .await;
+                    Ok(match result {
+                        Err(e) => {
+                            let error = e.as_database_error().unwrap();
+                            match error.code().unwrap().as_ref() {
+                                "54000" => Ok(()),
+                                _ => Err(e),
                             }
-                            Ok(_) => Ok(()),
-                        }.inspect_err(|e| pb.suspend(|| error!("1. {:?}", e)))?,
-                    )
+                        }
+                        Ok(_) => Ok(()),
+                    }
+                    .inspect_err(|e| pb.suspend(|| error!("1. {:?}", e)))?)
                 })
-                    .await?;
+                .await?;
             }
             pb.inc(1);
             Ok::<(), Error>(())
         };
         futs.push(fut);
-        if futs.len() >= 400 {
+        if !futs.is_empty() {
             futs.next().await.unwrap().unwrap();
         }
     }
-    while let Some(_) = futs.next().await {}
+    while (futs.next().await).is_some() {}
     Ok(())
 }
 
